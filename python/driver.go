@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"time"
+	"strings"
+	"bytes"
 
 	"github.com/hashicorp/consul-template/signals"
 	"github.com/hashicorp/go-hclog"
@@ -89,6 +91,27 @@ func CheckEndpointReachability() error {
 	}
 	return nil
 }
+
+func GetContainerIDByImage(imageName string) (string, error) {
+	// Use the `docker ps` command to get running containers and filter by image name.
+	cmd := exec.Command("docker", "ps", "--filter", fmt.Sprintf("ancestor=%s", imageName), "--format", "{{.ID}}")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+
+	err := cmd.Run()
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch container ID for image %q: %v", imageName, err)
+	}
+
+	// Get the container ID from the output.
+	containerID := strings.TrimSpace(out.String())
+	if containerID == "" {
+		return "", fmt.Errorf("no running container found for image %q", imageName)
+	}
+
+	return containerID, nil
+}
+
 
 func init() {
 	if runtime.GOOS == "linux" {
@@ -261,6 +284,102 @@ func (d *Driver) RecoverTask(handle *drivers.TaskHandle) error {
 	return nil
 }
 
+// func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drivers.DriverNetwork, error) {
+// 	if _, ok := d.tasks.Get(cfg.ID); ok {
+// 		return nil, nil, fmt.Errorf("task with ID %q already started", cfg.ID)
+// 	}
+
+// 	var driverConfig TaskConfig
+// 	if err := cfg.DecodeDriverConfig(&driverConfig); err != nil {
+// 		return nil, nil, fmt.Errorf("failed to decode driver config: %v", err)
+// 	}
+
+// 	if driverConfig.Script == "" {
+// 		return nil, nil, fmt.Errorf("script must be specified")
+// 	}
+
+// 	absPath, err := GetAbsolutePath("python")
+// 	if err != nil {
+// 		return nil, nil, fmt.Errorf("failed to find python binary: %s", err)
+// 	}
+
+// 	args := pythonCmdArgs(driverConfig)
+
+// 	d.logger.Info("starting python task", "driver_cfg", hclog.Fmt("%+v", driverConfig), "args", args)
+
+// 	handle := drivers.NewTaskHandle(taskHandleVersion)
+// 	handle.Config = cfg
+
+// 	pluginLogFile := filepath.Join(cfg.TaskDir().Dir, "executor.out")
+// 	executorConfig := &executor.ExecutorConfig{
+// 		LogFile:     pluginLogFile,
+// 		LogLevel:    "debug",
+// 		FSIsolation: capabilities.FSIsolation == drivers.FSIsolationChroot,
+// 	}
+
+// 	exec, pluginClient, err := executor.CreateExecutor(
+// 		d.logger.With("task_name", handle.Config.Name, "alloc_id", handle.Config.AllocID),
+// 		d.nomadConfig, executorConfig)
+// 	if err != nil {
+// 		return nil, nil, fmt.Errorf("failed to create executor: %v", err)
+// 	}
+
+// 	user := cfg.User
+// 	if user == "" {
+// 		user = "nobody"
+// 	}
+
+// 	execCmd := &executor.ExecCommand{
+// 		Cmd:              absPath,
+// 		Args:             args,
+// 		Env:              cfg.EnvList(),
+// 		User:             user,
+// 		ResourceLimits:   true,
+// 		Resources:        cfg.Resources,
+// 		TaskDir:          cfg.TaskDir().Dir,
+// 		StdoutPath:       cfg.StdoutPath,
+// 		StderrPath:       cfg.StderrPath,
+// 		Mounts:           cfg.Mounts,
+// 		Devices:          cfg.Devices,
+// 		NetworkIsolation: cfg.NetworkIsolation,
+// 	}
+
+// 	ps, err := exec.Launch(execCmd)
+// 	if err != nil {
+// 		pluginClient.Kill()
+// 		return nil, nil, fmt.Errorf("failed to launch command with executor: %v", err)
+// 	}
+
+// 	h := &taskHandle{
+// 		exec:         exec,
+// 		pid:          ps.Pid,
+// 		pluginClient: pluginClient,
+// 		taskConfig:   cfg,
+// 		procState:    drivers.TaskStateRunning,
+// 		startedAt:    time.Now().Round(time.Millisecond),
+// 		logger:       d.logger,
+// 	}
+
+// 	driverState := TaskState{
+// 		ReattachConfig: pstructs.ReattachConfigFromGoPlugin(pluginClient.ReattachConfig()),
+// 		Pid:            ps.Pid,
+// 		TaskConfig:     cfg,
+// 		StartedAt:      h.startedAt,
+// 	}
+
+// 	if err := handle.SetDriverState(&driverState); err != nil {
+// 		d.logger.Error("failed to start task, error setting driver state", "error", err)
+// 		exec.Shutdown("", 0)
+// 		pluginClient.Kill()
+// 		return nil, nil, fmt.Errorf("failed to set driver state: %v", err)
+// 	}
+
+// 	d.tasks.Set(cfg.ID, h)
+// 	go h.run()
+// 	return handle, nil, nil
+// }
+
+
 func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drivers.DriverNetwork, error) {
 	if _, ok := d.tasks.Get(cfg.ID); ok {
 		return nil, nil, fmt.Errorf("task with ID %q already started", cfg.ID)
@@ -275,15 +394,20 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 		return nil, nil, fmt.Errorf("script must be specified")
 	}
 
-	absPath, err := GetAbsolutePath("python")
+	// Get the container ID using the image name
+	containerID, err := GetContainerIDByImage("ghcr.io/alfred-hq/flyte-deps-development:latest")
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to find python binary: %s", err)
+		return nil, nil, fmt.Errorf("failed to get container ID for image: %s", err)
 	}
 
+	// Form the command to run the Python script inside the container
 	args := pythonCmdArgs(driverConfig)
 
-	d.logger.Info("starting python task", "driver_cfg", hclog.Fmt("%+v", driverConfig), "args", args)
+	// Create the exec command to run inside the container
+	cmd := []string{"docker", "exec", containerID, "python3", driverConfig.Script}
+	cmd = append(cmd, args...)
 
+	// Create a task handle for this task
 	handle := drivers.NewTaskHandle(taskHandleVersion)
 	handle.Config = cfg
 
@@ -294,6 +418,7 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 		FSIsolation: capabilities.FSIsolation == drivers.FSIsolationChroot,
 	}
 
+	// Initialize the executor
 	exec, pluginClient, err := executor.CreateExecutor(
 		d.logger.With("task_name", handle.Config.Name, "alloc_id", handle.Config.AllocID),
 		d.nomadConfig, executorConfig)
@@ -306,9 +431,10 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 		user = "nobody"
 	}
 
+	// Execute the command to start the Python script
 	execCmd := &executor.ExecCommand{
-		Cmd:              absPath,
-		Args:             args,
+		Cmd:              cmd[0], // docker exec
+		Args:             cmd[1:], // the rest of the command
 		Env:              cfg.EnvList(),
 		User:             user,
 		ResourceLimits:   true,
@@ -321,12 +447,14 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 		NetworkIsolation: cfg.NetworkIsolation,
 	}
 
+	// Launch the process inside the container
 	ps, err := exec.Launch(execCmd)
 	if err != nil {
 		pluginClient.Kill()
 		return nil, nil, fmt.Errorf("failed to launch command with executor: %v", err)
 	}
 
+	// Create task handle state
 	h := &taskHandle{
 		exec:         exec,
 		pid:          ps.Pid,
@@ -337,6 +465,7 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 		logger:       d.logger,
 	}
 
+	// Store the task handle and state
 	driverState := TaskState{
 		ReattachConfig: pstructs.ReattachConfigFromGoPlugin(pluginClient.ReattachConfig()),
 		Pid:            ps.Pid,
@@ -344,6 +473,7 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 		StartedAt:      h.startedAt,
 	}
 
+	// Set the driver state
 	if err := handle.SetDriverState(&driverState); err != nil {
 		d.logger.Error("failed to start task, error setting driver state", "error", err)
 		exec.Shutdown("", 0)
@@ -351,10 +481,16 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 		return nil, nil, fmt.Errorf("failed to set driver state: %v", err)
 	}
 
+	// Add the task handle to the task store
 	d.tasks.Set(cfg.ID, h)
+
+	// Launch the task in a separate goroutine for task monitoring
 	go h.run()
+
 	return handle, nil, nil
 }
+
+
 
 func pythonCmdArgs(driverConfig TaskConfig) []string {
 	args := []string{}
