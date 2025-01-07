@@ -3,6 +3,7 @@ package python
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,13 +12,11 @@ import (
 
 	"github.com/hashicorp/consul-template/signals"
 	"github.com/hashicorp/go-hclog"
-	"github.com/hashicorp/nomad/client/fingerprint"
 	"github.com/hashicorp/nomad/drivers/shared/eventer"
 	"github.com/hashicorp/nomad/drivers/shared/executor"
 	"github.com/hashicorp/nomad/helper/pluginutils/loader"
 	"github.com/hashicorp/nomad/plugins/base"
 	"github.com/hashicorp/nomad/plugins/drivers"
-	"github.com/hashicorp/nomad/plugins/drivers/utils"
 	"github.com/hashicorp/nomad/plugins/shared/hclspec"
 	pstructs "github.com/hashicorp/nomad/plugins/shared/structs"
 )
@@ -60,8 +59,8 @@ var (
 	// taskConfigSpec is the hcl specification for the driver config section of
 	// a taskConfig within a job. It is returned in the TaskConfigSchema RPC
 	taskConfigSpec = hclspec.NewObject(map[string]*hclspec.Spec{
-		"script":      hclspec.NewAttr("script", "string", true),
-		"args":        hclspec.NewAttr("args", "list(string)", false),
+		"script": hclspec.NewAttr("script", "string", true),
+		"args":   hclspec.NewAttr("args", "list(string)", false),
 	})
 
 	// capabilities is returned by the Capabilities RPC and indicates what
@@ -77,6 +76,20 @@ var (
 	}
 )
 
+func CheckEndpointReachability() error {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get("http://localhost:8260")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+	return nil
+}
+
 func init() {
 	if runtime.GOOS == "linux" {
 		capabilities.FSIsolation = drivers.FSIsolationChroot
@@ -85,8 +98,8 @@ func init() {
 
 // TaskConfig is the driver configuration of a taskConfig within a job
 type TaskConfig struct {
-	Script     string   `codec:"script"`
-	Args      []string `codec:"args"` // extra arguments to python executable
+	Script string   `codec:"script"`
+	Args   []string `codec:"args"` // extra arguments to python executable
 }
 
 // TaskState is the state which is encoded in the handle returned in
@@ -186,42 +199,16 @@ func (d *Driver) buildFingerprint() *drivers.Fingerprint {
 		HealthDescription: drivers.DriverHealthy,
 	}
 
-	if runtime.GOOS == "linux" {
-		// Only enable if w are root and cgroups are mounted when running on linux system
-		if !utils.IsUnixRoot() {
-			fp.Health = drivers.HealthStateUndetected
-			fp.HealthDescription = drivers.DriverRequiresRootMessage
-			return fp
-		}
-
-		mount, err := fingerprint.FindCgroupMountpointDir()
-		if err != nil {
-			fp.Health = drivers.HealthStateUnhealthy
-			fp.HealthDescription = drivers.NoCgroupMountMessage
-			d.logger.Warn(fp.HealthDescription, "error", err)
-			return fp
-		}
-
-		if mount == "" {
-			fp.Health = drivers.HealthStateUnhealthy
-			fp.HealthDescription = drivers.CgroupMountEmpty
-			return fp
-		}
-	}
-
-	version, err := pythonVersionInfo()
-	if err != nil {
-		// return no error, as it isn't an error to not find python, it just means we
-		// can't use it.
-		fp.Health = drivers.HealthStateUndetected
-		fp.HealthDescription = ""
+	if err := CheckEndpointReachability(); err != nil {
+		fp.Health = drivers.HealthStateUnhealthy
+		fp.HealthDescription = "Ray endpoint is not reachable: " + err.Error()
+		d.logger.Warn(fp.HealthDescription, "error", err)
 		return fp
 	}
-
 	fp.Attributes[driverAttr] = pstructs.NewBoolAttribute(true)
-	fp.Attributes[driverVersionAttr] = pstructs.NewStringAttribute(version)
 
 	return fp
+
 }
 
 func (d *Driver) RecoverTask(handle *drivers.TaskHandle) error {
@@ -549,4 +536,3 @@ func GetAbsolutePath(bin string) (string, error) {
 func (d *Driver) Shutdown() {
 	d.signalShutdown()
 }
-
