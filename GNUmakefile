@@ -1,6 +1,11 @@
-default: install
+PLUGIN_BINARY=python-driver
+export GO111MODULE=on
 
-install:
-	cd example-device && make
-	cd python-driver && make
+default: build
 
+.PHONY: clean
+clean: ## Remove build artifacts
+	rm -rf ${PLUGIN_BINARY}
+
+build:
+	go build -o ../plugins/${PLUGIN_BINARY} .
